@@ -1,0 +1,72 @@
+name: Publish to ClawHub
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Validate release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Check tag and SKILL.md versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ ! "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Invalid release tag '$GITHUB_REF_NAME'. Expected vX.Y.Z, for example v1.1.4."
+            exit 1
+          fi
+
+          tag_version="${GITHUB_REF_NAME#v}"
+          skill_version="$(sed -n 's/^version:[[:space:]]*//p' SKILL.md | head -n 1 | tr -d '"' | xargs)"
+
+          if [[ -z "$skill_version" ]]; then
+            echo "::error::SKILL.md does not contain a version field."
+            exit 1
+          fi
+
+          if [[ "$tag_version" != "$skill_version" ]]; then
+            echo "::error::Version mismatch: tag is $GITHUB_REF_NAME but SKILL.md is $skill_version."
+            exit 1
+          fi
+
+          echo "Version check passed: $skill_version"
+
+      - name: Run offline self-tests
+        run: python3 scripts/self_test_verify_references.py
+
+  dry-run:
+    name: Preview ClawHub publish
+    needs: validate
+    permissions:
+      contents: read
+      id-token: write
+    uses: openclaw/clawhub/.github/workflows/skill-publish.yml@v1
+    with:
+      skill_path: "."
+      owner: emp-tca
+      dry_run: true
+
+  publish:
+    name: Publish ClawHub release
+    needs: dry-run
+    permissions:
+      contents: read
+      id-token: write
+    uses: openclaw/clawhub/.github/workflows/skill-publish.yml@v1
+    with:
+      skill_path: "."
+      owner: emp-tca
+      dry_run: false
+    secrets:
+      clawhub_token: ${{ secrets.CLAWHUB_TOKEN }}
