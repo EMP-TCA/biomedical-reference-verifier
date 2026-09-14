@@ -12,6 +12,8 @@ from pathlib import Path
 
 SCRIPT = Path(__file__).with_name("verify_references.py")
 CONVERTER = Path(__file__).with_name("convert_reference_artifact.py")
+HTML_GENERATOR = Path(__file__).with_name("generate_html_report.py")
+HTML_TEMPLATE = Path(__file__).resolve().parent.parent / "assets" / "reference-audit-report-template.html"
 
 
 def write_records(path: Path) -> None:
@@ -21,8 +23,8 @@ def write_records(path: Path) -> None:
             {
                 "index": 1,
                 "source": {
-                    "original_text": "John Smith. Example title. Journal Name. 2024.",
-                    "title": "Example title",
+                    "original_text": "John Smith. DNA methylation in human embryos. Journal Name. 2024.",
+                    "title": "DNA methylation in human embryos",
                     "authors": ["John Smith"],
                     "year": "2024",
                     "journal": "Journal Name",
@@ -74,14 +76,19 @@ def test_default_outputs() -> None:
         assert_ok(result)
         assert (out / "reference-audit-summary.md").exists()
         assert (out / "reference-audit-detail.md").exists()
+        assert (out / "reference-audit-report.html").exists()
         assert (out / "references.auto-fixed.md").exists()
         assert (out / "reference-normalized-records.json").exists()
-        assert (out / "reference-normalized-input.md").exists()
-        assert (out / "references.extracted.md").exists()
-        assert not stale_json.exists()
+        assert not (out / "reference-normalized-input.md").exists()
+        assert not (out / "references.extracted.md").exists()
+        assert stale_json.read_text() == "stale"
         fixed = (out / "references.auto-fixed.md").read_text(encoding="utf-8")
         assert ".." not in fixed
-        assert "Smith J. Example title. Journal Name. 2024." in fixed
+        assert "Smith J. DNA methylation in human embryos. Journal Name. 2024." in fixed
+        html_report = (out / "reference-audit-report.html").read_text(encoding="utf-8")
+        assert "/*__REFERENCE_AUDIT_DATA__*/" not in html_report
+        assert '"report_category":"unchecked"' in html_report
+        assert "仅格式整理" in html_report
 
 
 def test_cleanup_all() -> None:
@@ -209,7 +216,7 @@ def test_field_level_prior_reuse_after_punctuation_change() -> None:
         initial = run_verifier(records, first, "--keep-process-json")
         assert_ok(initial)
         payload = json.loads(records.read_text(encoding="utf-8"))
-        payload["records"][0]["source"]["original_text"] = "John Smith — Example title; Journal Name (2024)."
+        payload["records"][0]["source"]["original_text"] = "John Smith — DNA methylation in human embryos; Journal Name (2024)."
         records.write_text(json.dumps(payload), encoding="utf-8")
         reused = run_verifier(records, second, "--reuse-results", str(first / "reference-audit.json"))
         assert_ok(reused)
@@ -235,6 +242,46 @@ def test_optional_index_output() -> None:
         assert "Reused prior results: `1`" in (reused_out / "reference-audit-summary.md").read_text(encoding="utf-8")
 
 
+def test_html_report_preserves_order_and_escapes_script_text() -> None:
+    with tempfile.TemporaryDirectory(prefix="bioverifier-test-") as tmp:
+        root = Path(tmp)
+        audit = root / "audit.json"
+        output = root / "report.html"
+        payload = {
+            "input": "records.json",
+            "format_consistency": {"majority_format": "ama"},
+            "runtime": {"mode": "balanced", "elapsed_seconds": 1.2},
+            "results": [
+                {"index": 20, "status": "verified", "severity": "none", "original": "SECOND-SOURCE-ORDER", "parsed_title": "Second", "canonical": None},
+                {"index": 3, "status": "total_fabrication", "severity": "high", "original": "FIRST-SOURCE-ORDER</script><script>alert(1)</script>", "parsed_title": "First", "canonical": None},
+            ],
+        }
+        audit.write_text(json.dumps(payload), encoding="utf-8")
+        generated = subprocess.run(
+            [sys.executable, str(HTML_GENERATOR), str(audit), "--output", str(output)],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        assert_ok(generated)
+        html_report = output.read_text(encoding="utf-8")
+        assert html_report.index("SECOND-SOURCE-ORDER") < html_report.index("FIRST-SOURCE-ORDER")
+        assert "</script><script>alert(1)</script>" not in html_report
+        assert "\\u003c/script\\u003e" in html_report
+        assert '"correct":1' in html_report
+        assert '"blocked":1' in html_report
+
+
+def test_html_template_keeps_color_scoped_to_confidence_groups() -> None:
+    template = HTML_TEMPLATE.read_text(encoding="utf-8")
+    assert "<script src=" not in template
+    assert '<link rel="stylesheet"' not in template
+    assert "<details" not in template
+    assert 'id="search"' in template and 'id="status"' in template
+    assert 'id="field"' in template and 'id="reset"' in template
+    assert 'aria-live="polite"' in template
+
+
 def main() -> int:
     tests = [
         test_default_outputs,
@@ -247,6 +294,8 @@ def main() -> int:
         test_modified_artifact_tolerance,
         test_field_level_prior_reuse_after_punctuation_change,
         test_optional_index_output,
+        test_html_report_preserves_order_and_escapes_script_text,
+        test_html_template_keeps_color_scoped_to_confidence_groups,
     ]
     for test in tests:
         test()

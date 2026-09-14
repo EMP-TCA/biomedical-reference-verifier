@@ -25,9 +25,11 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import unicodedata
 import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
-from dataclasses import asdict
+from dataclasses import asdict, replace
+from datetime import datetime, timezone
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Iterable
@@ -50,6 +52,7 @@ from verifier_policy import (
 )
 from verifier_prior_results import audit_result_from_dict, audit_to_index, load_prior_results, prior_result_for_entry, write_json_atomic
 from verifier_models import AuditResult, CanonicalRecord, OutputPaths, ReferenceEntry
+from generate_html_report import write_html_report
 
 
 DOI_RE = re.compile(r"\b10\.\d{4,9}/[-._;()/:A-Z0-9]+", re.I)
@@ -59,6 +62,8 @@ YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 REF_HEADING_RE = re.compile(r"^\s{0,3}#{0,6}\s*(references|bibliography|参考文献)\s*$", re.I)
 WORKSHEET_REQUIRED_FIELDS = {"title", "doi"}
 MACHINE_RECORD_SCHEMA = "biomedical-reference-verifier.records.v1"
+VERSION = "2.1.0"
+POLICY_VERSION = "2026-09-14.1"
 WORKSHEET_HEADER_ALIASES = {
     "#": "index",
     "no": "index",
@@ -304,7 +309,16 @@ def parse_machine_record_entries(text: str) -> list[ReferenceEntry]:
             entry = machine_record_to_entry(record, idx)
             if entry:
                 entries.append(entry)
+    validate_entry_indices(entries)
     return entries
+
+
+def validate_entry_indices(entries: list[ReferenceEntry]) -> None:
+    seen = set()
+    for entry in entries:
+        if entry.index in seen:
+            raise ValueError(f"Duplicate reference index: {entry.index}. Give each reference a unique index.")
+        seen.add(entry.index)
 
 
 def parse_json_or_jsonl(text: str) -> Any | None:
@@ -359,14 +373,14 @@ def machine_record_to_entry(record: dict[str, Any], fallback_index: int) -> Refe
     doi = clean_doi(scalar(identifiers.get("doi") or source.get("doi") or source.get("source_doi")))
     pmid_match = re.search(r"\d{6,9}", scalar(identifiers.get("pmid") or source.get("pmid") or source.get("source_pmid")))
     pmid = pmid_match.group(0) if pmid_match else ""
-    urls = normalize_urls(source.get("urls") or source.get("url"))
+    urls = normalize_urls(identifiers.get("urls") or source.get("urls") or source.get("url"))
     volume = scalar(source.get("volume"))
     issue = scalar(source.get("issue"))
     pages = scalar(source.get("pages") or source.get("page"))
     article_number = scalar(source.get("article_number") or source.get("article-number") or source.get("articleNumber"))
     original = scalar(source.get("original_text") or source.get("original") or source.get("raw") or title or doi or pmid)
     context = scalar(source.get("context") or source.get("note") or original)
-    source_lines = [int(value) for value in re.findall(r"\d+", scalar(source.get("source_line") or source.get("line") or ""))]
+    source_lines = [int(value) for value in re.findall(r"\d+", scalar(source.get("source_lines") or source.get("source_line") or source.get("line") or ""))]
     if not any([title, doi, pmid, original]):
         return None
     citation_format = scalar(source.get("citation_format") or record.get("citation_format")) or detect_format(original)
@@ -420,12 +434,12 @@ def normalize_authors(value: Any) -> list[str]:
                 if not name:
                     given = scalar(item.get("given") or item.get("givenName"))
                     family = scalar(item.get("family") or item.get("familyName"))
-                    name = " ".join(part for part in [given, family] if part)
+                    name = f"{family}, {given}" if family and given else family or given
             else:
                 name = scalar(item)
             if name:
                 authors.append(name)
-        return authors[:12]
+        return authors
     return parse_author_field(scalar(value))
 
 
@@ -606,7 +620,8 @@ def is_unreliable_source_title(title: str, authors: list[str], original: str) ->
             return True
     comma_like = title.count(",") + title.count(";") + title.count("，") + title.count("、")
     words = norm.split()
-    if comma_like >= 2 and len(words) <= 14 and not any(word in norm for word in ("trial", "study", "analysis", "effect", "role")):
+    chunks = re.split(r"[,;，、]", title)
+    if comma_like >= 2 and all(re.fullmatch(r"[\w'’ -]+ [A-Z]{1,5}\.?", chunk.strip()) for chunk in chunks):
         return True
     if DOI_RE.search(title) or PMID_RE.search(title):
         return True
@@ -706,6 +721,7 @@ class ApiClient:
         self.pubmed_limiter = RateLimiter(pubmed_rate, self.pubmed_workers)
         self.openalex_limiter = RateLimiter(OPENALEX_DEFAULT_RATE_PER_SECOND, self.openalex_workers)
         self.crossref_doi_cache: dict[str, CanonicalRecord | None] = {}
+        self.search_failures: dict[tuple[str, str], str] = {}
         self.crossref_search_cache: dict[str, list[CanonicalRecord]] = {}
         self.pubmed_pmid_cache: dict[str, CanonicalRecord | None] = {}
         self.pubmed_search_cache: dict[str, list[CanonicalRecord]] = {}
@@ -719,7 +735,7 @@ class ApiClient:
 
     def get_bytes(self, url: str) -> bytes:
         headers = {
-            "User-Agent": f"biomedical-reference-verifier/2.0 (mailto:{self.email})",
+            "User-Agent": f"biomedical-reference-verifier/{VERSION} (mailto:{self.email})",
             "Accept": "application/json, text/xml;q=0.9, */*;q=0.8",
         }
         req = urllib.request.Request(url, headers=headers)
@@ -792,6 +808,7 @@ class ApiClient:
         key = normalize_text(query)[:240]
         if key in self.crossref_search_cache:
             return self.crossref_search_cache[key]
+        self.search_failures.pop(("crossref", key), None)
         try:
             params = {
                 "query.title": query,
@@ -799,14 +816,15 @@ class ApiClient:
                 "mailto": self.email,
             }
             url = "https://api.crossref.org/works?" + urllib.parse.urlencode(params)
-            items = self.get_json(url).get("message", {}).get("items", [])
+            items = self.get_json(url)["message"]["items"]
             records = []
             for item in items:
                 record = crossref_record(item, score=float(item.get("score") or 0.0))
                 if record:
                     records.append(record)
-        except Exception:
-            records = []
+        except Exception as exc:
+            self.search_failures[("crossref", key)] = type(exc).__name__
+            return []
         self.crossref_search_cache[key] = records
         return records
 
@@ -844,6 +862,7 @@ class ApiClient:
         key = normalize_text(query)[:240]
         if key in self.pubmed_search_cache:
             return self.pubmed_search_cache[key]
+        self.search_failures.pop(("pubmed", key), None)
         try:
             params = {
                 "db": "pubmed",
@@ -856,11 +875,17 @@ class ApiClient:
             if self.ncbi_api_key:
                 params["api_key"] = self.ncbi_api_key
             url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?" + urllib.parse.urlencode(params)
-            ids = self.get_json(url).get("esearchresult", {}).get("idlist", [])
+            ids = self.get_json(url)["esearchresult"]["idlist"]
             pmid_map = self.fetch_pubmed_pmids(ids)
+            missing = [pmid for pmid in ids if pmid_map.get(pmid) is None]
+            if missing:
+                for pmid in missing:
+                    self.pubmed_pmid_cache.pop(pmid, None)
+                raise RuntimeError("PubMed search matched IDs but record retrieval was incomplete")
             records = [record for record in pmid_map.values() if record]
-        except Exception:
-            records = []
+        except Exception as exc:
+            self.search_failures[("pubmed", key)] = type(exc).__name__
+            return []
         self.pubmed_search_cache[key] = records
         return records
 
@@ -1008,6 +1033,7 @@ class ApiClient:
         key = normalize_text(query)[:240]
         if key in self.openalex_search_cache:
             return self.openalex_search_cache[key]
+        self.search_failures.pop(("openalex", key), None)
         try:
             params = self.openalex_params(
                 {
@@ -1017,10 +1043,11 @@ class ApiClient:
                 }
             )
             url = "https://api.openalex.org/works?" + urllib.parse.urlencode(params)
-            items = self.get_json(url).get("results", [])
+            items = self.get_json(url)["results"]
             records = [record for item in items if (record := openalex_record(item, score=0.0))]
-        except Exception:
-            records = []
+        except Exception as exc:
+            self.search_failures[("openalex", key)] = type(exc).__name__
+            return []
         self.openalex_search_cache[key] = records
         return records
 
@@ -1070,7 +1097,7 @@ def crossref_record(item: dict[str, Any], score: float) -> CanonicalRecord | Non
     for author in item.get("author") or []:
         family = author.get("family", "")
         given = author.get("given", "")
-        name = " ".join(part for part in [given, family] if part).strip()
+        name = f"{family}, {given}" if family and given else family or given or author.get("name", "")
         if name:
             authors.append(name)
     doi = clean_doi(item.get("DOI", ""))
@@ -1079,6 +1106,8 @@ def crossref_record(item: dict[str, Any], score: float) -> CanonicalRecord | Non
         title=title,
         year=year,
         journal=journal,
+        journal_abbreviation=html.unescape(first_value(item.get("short-container-title"))),
+        publication_years=list(dict.fromkeys(str(parts[0][0]) for key in ("published-print", "published-online", "issued") if (parts := item.get(key, {}).get("date-parts")) and parts[0])),
         volume=scalar(item.get("volume")),
         issue=scalar(item.get("issue")),
         pages=scalar(item.get("page")),
@@ -1108,7 +1137,8 @@ def pubmed_record(article: ET.Element) -> CanonicalRecord:
     for author in article.findall(".//Author"):
         last = author.findtext("LastName") or ""
         fore = author.findtext("ForeName") or author.findtext("Initials") or ""
-        name = " ".join(part for part in [fore, last] if part).strip()
+        name = f"{last}, {fore}" if last and fore else last or fore or author.findtext("CollectiveName") or ""
+        name = re.sub(r"\.?\s*Electronic address:.*$", "", name, flags=re.I).strip()
         if name:
             authors.append(name)
     return CanonicalRecord(
@@ -1116,6 +1146,7 @@ def pubmed_record(article: ET.Element) -> CanonicalRecord:
         title=title,
         year=year,
         journal=journal,
+        journal_abbreviation=article.findtext(".//Journal/ISOAbbreviation") or "",
         volume=volume,
         issue=issue,
         pages=pages,
@@ -1303,11 +1334,75 @@ def choose_best(entry: ReferenceEntry, records: Iterable[CanonicalRecord]) -> Ca
 def first_author_matches(parsed: list[str], canonical: list[str]) -> bool:
     if not parsed or not canonical:
         return False
-    parsed_norm = normalize_text(parsed[0]).split()
-    canon_norm = normalize_text(canonical[0]).split()
-    if not parsed_norm or not canon_norm:
-        return False
-    return parsed_norm[-1] == canon_norm[-1] or parsed_norm[0] == canon_norm[-1]
+    def key(name: str) -> str:
+        return normalize_text("".join(c for c in unicodedata.normalize("NFKD", author_parts(name)[0]) if not unicodedata.combining(c)))
+    return key(parsed[0]) == key(canonical[0])
+
+
+def author_parts(name: str) -> tuple[str, str]:
+    """Prefer explicit family, given; preserve ambiguous and corporate names."""
+    name = clean_terminal(re.sub(r"\.?\s*Electronic address:.*$", "", name, flags=re.I))
+    if re.search(r"\b(group|consortium|collaboration|committee|team|organization)s?\b", name, re.I):
+        return name, ""
+    if "," in name:
+        family, given = name.split(",", 1)
+        return family.strip(), given.strip()
+    parts = name.split()
+    if len(parts) < 2:
+        return name, ""
+    if re.fullmatch(r"(?:[A-Z]\.?){1,6}", parts[-1]):
+        return " ".join(parts[:-1]), parts[-1].replace(".", "")
+    # A full given-name-first string is supported; uncertain forms are retained.
+    if all(part[:1].isupper() and not part.isupper() for part in parts):
+        return parts[-1], " ".join(parts[:-1])
+    return name, ""
+
+
+def author_initials(given: str) -> str:
+    return "".join(p.replace(".", "") if p.replace(".", "").isupper() else p[0] for p in given.replace("-", " ").split() if p)
+
+
+def metadata_differences(entry: ReferenceEntry, record: CanonicalRecord) -> list[dict]:
+    differences = []
+    for field in ("title", "authors", "journal", "year", "doi", "pmid", "volume", "issue", "pages"):
+        old, new = getattr(entry, field), getattr(record, field)
+        if not old or not new:
+            continue
+        if field == "authors":
+            equivalent = authors_agree(old, new)
+        elif field == "journal":
+            equivalent = normalize_text(str(old)) in {normalize_text(value) for value in [record.journal, record.journal_abbreviation, *record.journal_aliases] if value}
+        elif field == "year":
+            equivalent = str(old) == str(new) or str(old) in record.publication_years
+        elif field == "pages":
+            equivalent = normalized_pages(str(old)) == normalized_pages(str(new))
+        else:
+            equivalent = normalize_text(str(old)) == normalize_text(str(new))
+        if not equivalent:
+            differences.append({"field": field, "before": old, "after": new, "source": record.source})
+    return differences
+
+
+def authors_agree(source: list[str], canonical: list[str]) -> bool:
+    """An explicit et al. means a prefix, not an additional author or full list."""
+    def key(name: str) -> str:
+        value = unicodedata.normalize("NFKD", format_ama_author(name))
+        return normalize_text("".join(c for c in value if not unicodedata.combining(c)))
+    truncated = bool(source and normalize_text(source[-1]) in {"et al", "等"})
+    named = source[:-1] if truncated else source
+    return bool(named) and (len(canonical) >= len(named) if truncated else len(canonical) == len(named)) and all(key(a) == key(b) for a, b in zip(named, canonical))
+
+
+def normalized_pages(value: str) -> str:
+    value = value.strip().lower().replace("–", "-").replace("—", "-")
+    match = re.fullmatch(r"([a-z]*)(\d+)-([a-z]*)(\d+)", value)
+    if not match:
+        return value
+    prefix, start, end_prefix, end = match.groups()
+    end_prefix = end_prefix or prefix
+    if len(end) < len(start):
+        end = start[:-len(end)] + end
+    return prefix + start if prefix + start == end_prefix + end else f"{prefix}{start}-{end_prefix}{end}"
 
 
 def year_agrees(parsed_year: str, canonical_year: str) -> bool:
@@ -1321,8 +1416,11 @@ def year_agrees(parsed_year: str, canonical_year: str) -> bool:
 
 def merge_equivalent(best: CanonicalRecord, records: Iterable[CanonicalRecord]) -> CanonicalRecord:
     for record in records:
-        if record is best or title_similarity(best.title, record.title) < 0.90:
+        if record is best or not ((best.doi and record.doi and clean_doi(best.doi) == clean_doi(record.doi)) or (best.pmid and record.pmid and best.pmid == record.pmid)):
             continue
+        best.journal_aliases = list(dict.fromkeys([*best.journal_aliases, record.journal, record.journal_abbreviation, *record.journal_aliases]))
+        if record.source == "PubMed" and record.year and title_similarity(best.title, record.title) >= 0.90:
+            best.publication_years = list(dict.fromkeys([*best.publication_years, record.year]))
         if not best.doi and record.doi:
             best.doi = record.doi
         if not best.pmid and record.pmid:
@@ -1385,28 +1483,32 @@ def build_fixed_reference(
     doi_output: str = "report-only",
     include_pmid: bool = False,
 ) -> str:
-    if not record or status in {"identifier_hijacking", "total_fabrication", "placeholder_generation", "unresolved"}:
+    if not record or status not in {"verified", "minor_fix", "minor_format_error", "formatted_only"}:
         if status in SEVERE_STATUSES:
-            return f"{entry.original}  <!-- {status}: not auto-fixed -->"
+            return f"{entry.original}  [不可用：{status}，未自动修复]"
         return entry.original
     target_format = majority_format if majority_format in {"ama", "apa", "gbt7714", "vancouver"} else entry.citation_format
     if target_format == "free_text":
         target_format = "ama"
     authors = record.authors or entry.authors
     author_text = format_authors(authors, target_format)
-    year = record.year or entry.year
-    journal = record.journal or entry.journal
+    year = entry.year if entry.year in record.publication_years else record.year or entry.year
+    journal = entry.journal if normalize_text(entry.journal) in {normalize_text(value) for value in record.journal_aliases if value} else record.journal or entry.journal
     title = record.title or entry.title
     volume = record.volume or entry.volume
     issue = record.issue or entry.issue
     pages = record.pages or entry.pages or record.article_number or entry.article_number
     if target_format == "gbt7714":
-        core = join_sentence_parts([author_text, f"{clean_terminal(title)}[J]" if title else "", join_comma_parts([journal, year])])
-        return append_identifiers(f"[{entry.index}] {core}", record, doi_output, include_pmid)
+        publication = join_comma_parts([journal, year, volume + (f"({issue})" if issue else "")])
+        if pages:
+            publication += f": {pages}"
+        core = join_sentence_parts([author_text, f"{clean_terminal(title)}[J]" if title else "", publication])
+        return append_identifiers(f"[{entry.index}] {core}", record, "append" if entry.doi and not entry.recovered_doi else doi_output, include_pmid)
     if target_format in {"vancouver", "ama"}:
-        return format_ama_reference(entry.index, author_text, title, journal, year, volume, issue, pages, record, doi_output, include_pmid)
-    core = join_sentence_parts([author_text, f"({year})" if year else "", title, journal])
-    return append_identifiers(core, record, doi_output, include_pmid)
+        return format_ama_reference(entry.index, author_text, title, journal, year, volume, issue, pages, record, "append" if entry.doi and not entry.recovered_doi else doi_output, include_pmid)
+    publication = join_comma_parts([journal, volume + (f"({issue})" if issue else ""), pages])
+    core = join_sentence_parts([author_text, f"({year})" if year else "", title, publication])
+    return append_identifiers(core, record, "append" if entry.doi and not entry.recovered_doi else doi_output, include_pmid)
 
 
 def clean_terminal(value: str) -> str:
@@ -1489,43 +1591,29 @@ def format_ama_publication_detail(year: str, volume: str, issue: str, pages: str
 
 def format_authors(authors: list[str], citation_format: str) -> str:
     if not authors:
-        return "Unknown author"
+        return ""
     if citation_format == "apa":
         formatted = []
-        for name in authors[:8]:
-            parts = name.replace(",", " ").split()
-            if len(parts) == 1:
-                formatted.append(parts[0])
-            else:
-                family = parts[-1]
-                initials = " ".join(f"{p[0]}." for p in parts[:-1] if p)
-                formatted.append(f"{family}, {initials}".strip())
+        for name in authors:
+            family, given = author_parts(name)
+            initials = " ".join(f"{letter}." for letter in author_initials(given))
+            formatted.append(f"{family}, {initials}" if initials else family)
+        if len(formatted) > 20:
+            return ", ".join(formatted[:19]) + ", … " + formatted[-1]
         if len(formatted) == 1:
             return formatted[0]
         return ", ".join(formatted[:-1]) + ", & " + formatted[-1]
     if citation_format in {"ama", "vancouver"}:
         formatted = [format_ama_author(name) for name in authors if format_ama_author(name)]
         if len(formatted) > 6:
-            return ", ".join(formatted[:3] + ["et al"])
+            return ", ".join(formatted[:(3 if citation_format == "ama" else 6)] + ["et al"])
         return ", ".join(formatted)
-    return ", ".join(authors[:8])
+    return ", ".join(authors[:3] + (["et al"] if len(authors) > 3 else []))
 
 
 def format_ama_author(name: str) -> str:
-    name = clean_terminal(name)
-    if not name:
-        return ""
-    if "," in name:
-        family, given = [part.strip() for part in name.split(",", 1)]
-        parts = [part for part in given.replace("-", " ").split() if part]
-        initials = "".join(clean_terminal(part)[0] for part in parts if clean_terminal(part))
-        return f"{family} {initials}".strip()
-    parts = [part for part in name.split() if part]
-    if len(parts) <= 1:
-        return name
-    family = parts[-1]
-    initials = "".join(clean_terminal(part)[0] for part in parts[:-1] if clean_terminal(part))
-    return f"{family} {initials}".strip()
+    family, given = author_parts(name)
+    return f"{family} {author_initials(given)}".strip()
 
 
 def classify_entries(
@@ -1563,10 +1651,27 @@ def classify_entries(
             openalex_record_for_pmid = openalex_pmid_records[entry.pmid]
             openalex_record_for_pmid.openalex_corroborated = True
             id_candidates.append(openalex_record_for_pmid)
-        id_best = choose_best(entry, id_candidates)
+        provider_records = [asdict(record) for record in id_candidates]
+        id_best = doi_records.get(entry.doi) or choose_best(entry, id_candidates)
+        placeholder_replaced = False
+        if id_best and canonical_title_placeholder(id_best.title):
+            alternatives = [record for record in id_candidates if record is not id_best and record.doi and clean_doi(record.doi) == clean_doi(entry.doi) and not canonical_title_placeholder(record.title)]
+            replacement = choose_best(entry, alternatives)
+            if replacement and title_similarity(entry.title, replacement.title) >= 0.86 and year_agrees(entry.year, replacement.year) and first_author_matches(entry.authors, replacement.authors):
+                id_best = replacement
+                placeholder_replaced = True
         if id_best:
             id_best = merge_equivalent(id_best, id_candidates)
         result = first_round_classification(entry, id_best, output_format, doi_output, include_pmid)
+        result.provider_records = provider_records
+        if placeholder_replaced:
+            result.issues.append("Primary provider returned a placeholder title; used another enabled provider's record for the same DOI, without changing the identifier.")
+        if entry.doi and entry.pmid and id_best and any(record.doi and clean_doi(record.doi) != clean_doi(entry.doi) for record in id_candidates):
+            result.status = "identifier_hijacking"
+            result.severity = "critical"
+            result.issues.append("Supplied DOI and PMID resolve to conflicting records; do not merge them.")
+            result.suggested_action = "Review both identifier records before any repair."
+            result.fixed_reference = build_fixed_reference(entry, None, result.status, output_format, doi_output, include_pmid)
         results.append(result)
 
     detect_shifted_identifiers(entries, results)
@@ -1575,22 +1680,22 @@ def classify_entries(
     return results
 
 
-def recover_missing_dois_early(entries: list[ReferenceEntry], client: ApiClient, metrics: RuntimeMetrics, mode: str) -> None:
+def recover_missing_dois_early(entries: list[ReferenceEntry], client: ApiClient, metrics: RuntimeMetrics, mode: str, pubmed_mode: str = "corroborate", openalex_mode: str = "corroborate") -> None:
     """Recover DOI candidates before identifier verification, without writing them to the source file."""
     targets = [entry for entry in entries if not entry.doi and entry.title_reliable and entry.title]
     def recover_one(entry: ReferenceEntry) -> None:
         candidates = client.crossref_search(entry.title, limit=3)
         best = choose_best(entry, candidates)
         strong = best and title_similarity(entry.title, best.title) >= 0.86 and year_agrees(entry.year, best.year)
-        if not strong and mode != "fast":
+        if not strong and mode != "fast" and openalex_mode != "off":
             candidates.extend(client.openalex_search(entry.title, limit=3))
             best = choose_best(entry, candidates)
             strong = best and title_similarity(entry.title, best.title) >= 0.86 and year_agrees(entry.year, best.year)
-        if not strong and mode != "fast":
+        if not strong and mode != "fast" and pubmed_mode != "off":
             candidates.extend(client.pubmed_search(f'"{entry.title}"', limit=3))
             best = choose_best(entry, candidates)
             strong = best and title_similarity(entry.title, best.title) >= 0.86 and year_agrees(entry.year, best.year)
-        if strong and best and best.doi:
+        if strong and best and best.doi and entry.authors and best.authors and first_author_matches(entry.authors, best.authors):
             recovered = clean_doi(best.doi)
             source = best.source
             entry.recovered_doi = recovered
@@ -1634,11 +1739,11 @@ def format_only_results(
         issues.append("Format-only pipeline: reference was normalized from source fields without external authenticity verification.")
         if not entry.title_reliable:
             issues.append("Parsed title is missing or unreliable; formatted output may need manual source cleanup.")
-        fixed = build_fixed_reference(entry, source_record, "minor_format_error", output_format, doi_output, include_pmid)
+        fixed = build_fixed_reference(entry, source_record if entry.title_reliable else None, "formatted_only", output_format, doi_output, include_pmid)
         results.append(
             AuditResult(
                 index=entry.index,
-                status="minor_format_error",
+                status="formatted_only",
                 severity="low",
                 citation_format=entry.citation_format,
                 original=entry.original,
@@ -1660,6 +1765,35 @@ def format_only_results(
             )
         )
     return results
+
+
+def describe_result(result: AuditResult, entry: ReferenceEntry, pipeline: str, mode: str, channels: list[str]) -> None:
+    """Keep eligibility, evidence coverage and editing separate."""
+    result.verification_level = (
+        "not_checked" if pipeline == "format-only" else
+        "identifier_only" if result.status == "verified_identifier_only" else
+        "metadata_verified" if result.status in {"verified", "minor_fix"} else
+        "conflict" if result.identifier_record or result.canonical else "unresolved"
+    )
+    result.usable = pipeline == "verify" and result.status in {"verified", "minor_fix"}
+    result.repair_state = (
+        "formatted" if pipeline == "format-only" and entry.title_reliable else
+        "repaired" if result.usable and result.fixed_reference != result.original else
+        "unchanged" if result.usable else "retained_for_review"
+    )
+    if not result.checked_at:
+        result.checked_at = datetime.now(timezone.utc).isoformat()
+        result.check_mode = mode
+        result.check_channels = channels
+    result.policy_version = POLICY_VERSION
+    result.pipeline = pipeline
+    result.source_fields = {field: getattr(entry, field) for field in ("title", "authors", "year", "journal", "doi", "pmid", "volume", "issue", "pages", "article_number", "urls")}
+    if entry.recovered_doi:
+        result.source_fields["doi"] = ""
+        result.parsed_doi = ""
+    if not result.usable and pipeline == "verify":
+        result.suggested_action = "不可用：当前证据未通过核查。保留原文供复核，不纳入可用引用。 " + result.suggested_action
+
 
 
 def run_identifier_queries(
@@ -1719,8 +1853,9 @@ def run_identifier_queries(
                     pmid_records, pubmed_doi_records = value
                 elif name == "openalex":
                     openalex_doi_records, openalex_pmid_records = value
-        except Exception:
-            pass
+        except Exception as exc:
+            if getattr(client, "metrics", None):
+                client.metrics.record(name, "query_failure", 0, detail=type(exc).__name__)
         finally:
             with results_lock:
                 finished.add(name)
@@ -1740,7 +1875,7 @@ def run_identifier_queries(
     # because PubMed or OpenAlex happened to finish first.
     while True:
         with results_lock:
-            if "crossref" in finished:
+            if "crossref" in finished and (not pmids or pubmed_mode == "off" or "pubmed" in finished):
                 break
         done_event.wait(timeout=0.05)
         done_event.clear()
@@ -1765,6 +1900,10 @@ def run_identifier_queries(
     return doi_records, pmid_records, pubmed_doi_records, openalex_doi_records, openalex_pmid_records
 
 
+def canonical_title_placeholder(title: str) -> bool:
+    return normalize_text(title) in {"oup accepted manuscript", "accepted manuscript", "untitled", "article", "journal pre proof", "corrected proof"}
+
+
 def first_round_classification(
     entry: ReferenceEntry,
     id_best: CanonicalRecord | None,
@@ -1785,13 +1924,29 @@ def first_round_classification(
             severity = "low"
             issues.append("Identifier resolved to a canonical record, but source-title matching was skipped because the input title is missing or unreliable.")
             suggested = "Use canonical DOI metadata; fix the worksheet/source title before judging title agreement or DOI hijacking."
+        elif canonical_title_placeholder(id_best.title):
+            status = "unresolved"
+            severity = "high"
+            issues.append("Provider returned a placeholder title; this is insufficient evidence of identifier hijacking.")
+            suggested = "Check the same identifier in another enabled channel; retain original until verified."
         elif sim < 0.70:
             status = "identifier_hijacking"
             severity = "critical"
             issues.append(f"Supplied DOI/PMID resolves to a different title (similarity {sim:.2f}).")
             suggested = "Do not trust this identifier; report the DOI conflict and ask before deeper manual recovery."
-        elif sim >= 0.86 and year_agrees(entry.year, id_best.year):
-            if has_minor_fix(entry, id_best):
+        elif sim >= 0.86 and entry.year and id_best.year and year_agrees(entry.year, id_best.year) and entry.authors and id_best.authors and first_author_matches(entry.authors, id_best.authors):
+            conflicts = metadata_differences(entry, id_best)
+            conflicts.extend({"field": field, "before": getattr(entry, field), "after": "未取得对应证据", "source": id_best.source} for field in ("journal", "doi", "pmid") if getattr(entry, field) and not getattr(id_best, field))
+            # Only an explicit provider abbreviation establishes journal equivalence.
+            conflicts = [d for d in conflicts if not (d["field"] == "journal" and id_best.journal_abbreviation and normalize_text(entry.journal) == normalize_text(id_best.journal_abbreviation))]
+            # A one-year difference requires date provenance; never silently fix it.
+            conflicts = [d for d in conflicts if d["field"] != "title" or sim < 0.98]
+            if conflicts:
+                status = "partial_attribute_corruption"
+                severity = "medium"
+                issues.extend(f"Field conflict ({d['field']}): {d['before']} → {d['after']} [{d['source']}]" for d in conflicts)
+                suggested = "Metadata differ; retain original and review the field-level evidence before repair."
+            elif has_minor_fix(entry, id_best):
                 status = "minor_fix"
                 severity = "low"
                 issues.extend(minor_fix_issues(entry, id_best))
@@ -1804,6 +1959,10 @@ def first_round_classification(
             status = "partial_attribute_corruption"
             severity = "medium"
             issues.append(f"Canonical record found, but metadata only partially match (title similarity {sim:.2f}).")
+            if not entry.authors or not id_best.authors or not first_author_matches(entry.authors, id_best.authors):
+                issues.append("First-author evidence is missing or conflicting.")
+            if not entry.year or not id_best.year:
+                issues.append("Publication-year evidence is missing.")
             if not year_agrees(entry.year, id_best.year):
                 issues.append(f"Year differs: parsed {entry.year or 'missing'}, canonical {id_best.year or 'missing'}.")
             suggested = "Use title recovery and canonical metadata before rewriting."
@@ -1843,6 +2002,7 @@ def first_round_classification(
         suggested_action=suggested,
         fixed_reference=fixed,
         evidence_links=evidence_links(canonical or id_best, entry),
+        field_differences=metadata_differences(entry, id_best) if id_best else [],
     )
 
 
@@ -1923,14 +2083,22 @@ def recover_by_title(
             result.fixed_reference = build_fixed_reference(entry, None, result.status, majority_format, doi_output, include_pmid)
             result.evidence_links = evidence_links(None, entry)
             continue
-        candidates = client.crossref_search(entry.title or entry.original, limit=3)
+        failed_searches = []
+        def search(provider: str, query: str) -> list[CanonicalRecord]:
+            records = getattr(client, provider + "_search")(query, limit=3)
+            key = normalize_text(query)[:240]
+            failure = getattr(client, "search_failures", {}).get((provider, key))
+            if failure:
+                failed_searches.append(f"{provider}: {failure}")
+            return list(records)
+        candidates = search("crossref", entry.title or entry.original)
         best_probe = choose_best(entry, candidates) if candidates else None
         if (not best_probe or title_similarity(entry.title, best_probe.title) < 0.86) and openalex_mode != "off":
-            candidates.extend(client.openalex_search(entry.title or entry.original, limit=3))
+            candidates.extend(search("openalex", entry.title or entry.original))
             best_probe = choose_best(entry, candidates) if candidates else None
         if (not best_probe or title_similarity(entry.title, best_probe.title) < 0.86) and pubmed_mode != "off":
             exact_query = f'"{entry.title}"' if entry.title else entry.original
-            candidates.extend(client.pubmed_search(exact_query, limit=3))
+            candidates.extend(search("pubmed", exact_query))
         best = choose_best(entry, candidates)
         if best:
             best = merge_equivalent(best, candidates)
@@ -1948,6 +2116,14 @@ def recover_by_title(
             if previous in {"identifier_hijacking", "shifted_identifier"}:
                 result.issues.append("Supplied identifier remains wrong; fixed copy uses title-recovered metadata.")
             result.suggested_action = "Use recovered canonical metadata; no AI-assisted manual search needed unless user wants extra confirmation."
+            # Apply the same identity and field checks to recovered records.
+            checked = first_round_classification(entry, best, majority_format, doi_output, include_pmid)
+            if checked.status not in {"verified", "minor_fix"}:
+                result.status = checked.status
+                result.severity = checked.severity
+                result.issues.extend(checked.issues)
+                result.suggested_action = checked.suggested_action
+            result.field_differences = checked.field_differences
             result.fixed_reference = build_fixed_reference(entry, best, result.status, majority_format, doi_output, include_pmid)
             result.evidence_links = evidence_links(best, entry)
         elif best and sim >= 0.78:
@@ -1958,6 +2134,13 @@ def recover_by_title(
             result.issues.append(f"Title recovery found a possible but low-confidence match (similarity {sim:.2f}).")
             result.suggested_action = "Do not auto-fix; ask user before manual AI-assisted recovery."
             result.evidence_links = evidence_links(best, entry)
+        elif failed_searches:
+            result.status = "unresolved"
+            result.severity = "high"
+            result.issues.append("Title recovery incomplete due to failed queries: " + "; ".join(failed_searches))
+            result.suggested_action = "Not eligible for use. Retry failed queries before concluding that no matching record exists."
+            result.fixed_reference = build_fixed_reference(entry, None, result.status, majority_format, doi_output, include_pmid)
+            result.evidence_links = evidence_links(None, entry)
         elif result.status == "unresolved":
             result.status = "total_fabrication" if entry.title and entry.authors and entry.year else "unresolved"
             result.severity = "critical" if result.status == "total_fabrication" else "high"
@@ -2004,15 +2187,31 @@ def build_output_paths(input_path: Path, output_dir: Path, detail_output: Path |
         extracted_references=output_dir / "references.extracted.md",
         summary=output_dir / "reference-audit-summary.md",
         detail=detail_output or output_dir / "reference-audit-detail.md",
+        html_report=output_dir / "reference-audit-report.html",
         fixed=output_dir / fixed_name,
         audit_json=output_dir / "reference-audit.json",
     )
+
+
+def validate_output_paths(input_path: Path, paths: OutputPaths, index_path: Path | None = None, prior_path: Path | None = None) -> None:
+    targets = [Path(value) for value in asdict(paths).values()]
+    if index_path is not None:
+        targets.append(index_path)
+    protected = [input_path] + ([prior_path] if prior_path is not None else [])
+    def same(a: Path, b: Path) -> bool:
+        return a.resolve() == b.resolve() or (a.exists() and b.exists() and a.samefile(b))
+    for i, target in enumerate(targets):
+        if any(same(target, source) for source in protected):
+            raise ValueError(f"Output path would overwrite an input artifact: {target}. Choose a separate output directory.")
+        if any(same(target, other) for other in targets[:i]):
+            raise ValueError(f"Output paths collide: {target}. Choose distinct report paths.")
 
 
 def result_file_map(paths: OutputPaths) -> dict[str, str]:
     return {
         "summary_report": str(paths.summary),
         "detail_report": str(paths.detail),
+        "html_report": str(paths.html_report),
         "fixed_copy": str(paths.fixed),
     }
 
@@ -2068,11 +2267,7 @@ def cleanup_generated_process_files(
     retained = dict(process_files)
     removed: list[str] = []
     for path in stale_paths:
-        if path.exists():
-            path.unlink()
-            removed.append(str(path))
-        else:
-            removed.append(f"{path} (not written by default)")
+        removed.append(f"{path} (not written this run; any existing file is retained)")
     for label in selected_labels:
         path = Path(process_files[label])
         if path.exists():
@@ -2096,20 +2291,28 @@ def write_outputs(
     metrics: RuntimeMetrics | None = None,
     write_index: bool = False,
 ) -> dict[str, str]:
-    output_dir.mkdir(parents=True, exist_ok=True)
     paths = build_output_paths(input_path, output_dir, detail_output)
+    validate_output_paths(input_path, paths, output_dir / "reference-index.json" if write_index else None)
+    output_dir.mkdir(parents=True, exist_ok=True)
     fmt = format_consistency(entries)
     detail = render_detail(results, fmt)
     fixed = render_fixed_references(results)
     result_files = result_file_map(paths)
     process_files = process_file_map(paths, keep_process_json)
-    cleanup_labels = parse_process_cleanup(cleanup_process_files, process_files)
+    cleanup_labels = parse_process_cleanup(cleanup_process_files, process_files) if cleanup_process_files else {"normalized_input_table", "extracted_references"}
     stale_paths = [] if keep_process_json else [paths.audit_json]
 
     paths.normalized_input.write_text(render_normalized_input(entries), encoding="utf-8")
     paths.normalized_records.write_text(json.dumps(render_normalized_records(entries), ensure_ascii=False, indent=2), encoding="utf-8")
     paths.extracted_references.write_text(render_extracted_references(entries), encoding="utf-8")
     paths.detail.write_text(detail, encoding="utf-8")
+    write_html_report(
+        paths.html_report,
+        input_path=str(input_path),
+        results=results,
+        format_consistency=fmt,
+        runtime=metrics,
+    )
     paths.fixed.write_text(fixed, encoding="utf-8")
 
     retained_process_files, removed_process_files = cleanup_generated_process_files(process_files, cleanup_labels, stale_paths)
@@ -2150,6 +2353,7 @@ def write_outputs(
             "extracted_references": str(paths.extracted_references) if "extracted_references" in retained_process_files else "",
             "summary": str(paths.summary),
             "detail": str(paths.detail),
+            "html_report": str(paths.html_report),
             "fixed": str(paths.fixed),
             "json": str(paths.audit_json) if keep_process_json and "audit_json" in retained_process_files else "",
         },
@@ -2286,17 +2490,19 @@ def render_summary(
         f"- Verified: {counts.get('verified', 0)}",
         f"- DOI/PMID verified only: {counts.get('verified_identifier_only', 0)}",
         f"- Auto-fixable/minor: {counts.get('minor_fix', 0)}",
-        f"- Format-only normalized: {counts.get('minor_format_error', 0)}",
+        f"- Format-only normalized (not verified): {counts.get('formatted_only', 0)}",
+        f"- Eligible for use after verification: {sum(r.usable for r in results)}",
+        f"- Not eligible / not verified: {sum(not r.usable for r in results)}",
         f"- Partial/corrupted: {counts.get('partial_attribute_corruption', 0)}",
         f"- Parser/input errors: {counts.get('parser_error', 0)}",
         f"- Severe/high-risk: {len(severe)}",
         f"- Format: majority `{fmt['majority_format']}`, mixed={fmt['mixed']}",
         f"- Normalized records: {normalized_records_path}",
-        f"- Normalized input: {normalized_path}",
-        f"- Extracted references: {extracted_path}",
+        f"- Normalized input: {normalized_path} ({'retained' if 'normalized_input_table' in retained_process_files else 'cleaned'})",
+        f"- Extracted references: {extracted_path} ({'retained' if 'extracted_references' in retained_process_files else 'cleaned'})",
         f"- Detail report: {detail_path}",
         f"- Auto-fixed copy: {fixed_path}",
-        "- DOI handling: DOI verification/recovery is recorded in the reports; fixed citations include DOI only when `--doi-output append` is used.",
+        "- DOI handling: preserve source DOI; append newly recovered DOI only with `--doi-output append`.",
         "",
         "## Output Files",
         "",
@@ -2347,6 +2553,7 @@ def render_detail(results: list[AuditResult], fmt: dict[str, Any]) -> str:
     for result in results:
         groups[result.status].append(result)
     order = [
+        "formatted_only",
         "parser_error",
         "identifier_hijacking",
         "shifted_identifier",
@@ -2474,6 +2681,7 @@ def escape_pipe(value: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Batch-verify or format biomedical references.")
+    parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("input", help="Text, Markdown, or manuscript file containing references")
     parser.add_argument("--output-dir", help="Directory for summary/detail/fixed/json outputs. Defaults to a temp directory.")
     parser.add_argument("--output", help="Compatibility option: write detailed report to this path")
@@ -2507,7 +2715,12 @@ def main() -> int:
     phase_started = time.monotonic()
     input_path = Path(args.input)
     text = input_path.read_text(encoding="utf-8")
-    entries = build_entries(text, args.references_heading, args.input_mode)
+    try:
+        entries = build_entries(text, args.references_heading, args.input_mode)
+        validate_entry_indices(entries)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     if args.max_records:
         entries = entries[: args.max_records]
     if not entries:
@@ -2519,10 +2732,20 @@ def main() -> int:
     if detail_output and not args.output_dir:
         output_dir = detail_output.parent
 
+    try:
+        validate_output_paths(input_path, build_output_paths(input_path, output_dir, detail_output),
+                              output_dir / "reference-index.json" if args.write_index else None,
+                              Path(args.reuse_results) if args.reuse_results else None)
+    except ValueError as exc:
+        print(str(exc), file=sys.stderr)
+        return 2
     phase_started = time.monotonic()
     reuse_warnings: list[str] = []
+    enabled_channels = ["Crossref"] if args.pipeline == "verify" else []
+    if args.pipeline == "verify" and args.mode != "fast":
+        enabled_channels.extend(name for name, setting in (("PubMed", args.pubmed_mode), ("OpenAlex", args.openalex_mode)) if setting != "off")
     try:
-        prior_rows = load_prior_results(args.reuse_results, reuse_warnings) if args.reuse_results else {}
+        prior_rows = load_prior_results(args.reuse_results, reuse_warnings, pipeline=args.pipeline, mode=args.mode, channels=enabled_channels, policy_version=POLICY_VERSION) if args.reuse_results else {}
     except ValueError as exc:
         print(str(exc), file=sys.stderr)
         return 2
@@ -2537,6 +2760,12 @@ def main() -> int:
             try:
                 reused = audit_result_from_dict(prior)
                 reused.index = entry.index
+                reused.original = entry.original
+                output_style = majority_citation_format(entries) if args.citation_style == "source-majority" else args.citation_style
+                if args.pipeline == "format-only":
+                    reused = format_only_results([entry], output_style, args.doi_output, args.include_pmid)[0]
+                else:
+                    reused.fixed_reference = build_fixed_reference(entry, reused.canonical, reused.status, output_style, args.doi_output, args.include_pmid)
                 reused_by_index[entry.index] = reused
                 metrics.reused += 1
                 continue
@@ -2562,7 +2791,7 @@ def main() -> int:
             metrics=metrics,
         )
         phase_started = time.monotonic()
-        recover_missing_dois_early(pending_entries, client, metrics, args.mode)
+        recover_missing_dois_early(pending_entries, client, metrics, args.mode, args.pubmed_mode, args.openalex_mode)
         metrics.finish_phase("doi_recovery", phase_started)
         effective_pubmed_mode = "off" if args.mode == "fast" else args.pubmed_mode
         effective_openalex_mode = "off" if args.mode == "fast" else args.openalex_mode
@@ -2580,6 +2809,8 @@ def main() -> int:
         metrics.finish_phase("verification", phase_started)
     fresh_by_index = {result.index: result for result in fresh_results}
     results = [reused_by_index.get(entry.index) or fresh_by_index[entry.index] for entry in entries]
+    for entry, result in zip(entries, results):
+        describe_result(result, entry, args.pipeline, args.mode, enabled_channels)
     try:
         write_outputs(
             input_path,

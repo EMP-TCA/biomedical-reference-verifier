@@ -12,6 +12,9 @@ class CanonicalRecord:
     title: str = ""
     year: str = ""
     journal: str = ""
+    journal_abbreviation: str = ""
+    journal_aliases: list[str] = field(default_factory=list)
+    publication_years: list[str] = field(default_factory=list)
     volume: str = ""
     issue: str = ""
     pages: str = ""
@@ -76,6 +79,17 @@ class AuditResult:
     evidence_links: list[str]
     shifted_from_index: int | None = None
     shifted_to_index: int | None = None
+    verification_level: str = "not_checked"
+    usable: bool = False
+    repair_state: str = "unchanged"
+    field_differences: list[dict] = field(default_factory=list)
+    policy_version: str = ""
+    checked_at: str = ""
+    check_mode: str = ""
+    check_channels: list[str] = field(default_factory=list)
+    pipeline: str = ""
+    source_fields: dict = field(default_factory=dict)
+    provider_records: list[dict] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -85,5 +99,6 @@ class OutputPaths:
     extracted_references: Path
     summary: Path
     detail: Path
+    html_report: Path
     fixed: Path
     audit_json: Path

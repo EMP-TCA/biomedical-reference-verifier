@@ -11,3 +11,4 @@ reference-normalized-*.md
 references.extracted.md
 reference-audit.json
 reference-index.json
+*.py[cod]

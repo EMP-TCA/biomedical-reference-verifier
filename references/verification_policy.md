@@ -15,6 +15,7 @@
 - `verified`: DOI/PMID or title search resolves to a canonical record and title, year, and first-author evidence agree.
 - `verified_identifier_only`: DOI/PMID resolves to a canonical record, but the source title is missing or unreliable, so only the identifier is verified.
 - `parser_error`: the input row is malformed or the parsed/source title is an author line, table header, metadata field, or other non-title text; stop before treating the row as a bibliographic conflict.
+- `formatted_only`: formatting executed, authenticity not checked; not eligible for use on that basis.
 - `minor_fix` / `minor_format_error`: the paper is real and metadata agree; only DOI casing, punctuation, URL style, initials, journal abbreviation, or minor year formatting needs correction.
 - `partial_attribute_corruption`: the paper is real, but one or more attributes are corrupted, such as author, title, journal, year, volume/pages, DOI, or PMID.
 - `identifier_hijacking`: DOI, PMID, or URL is real, but it points to a different paper than the reference text.
@@ -30,8 +31,8 @@
 - Title similarity 0.86-0.89: acceptable match if year and first author agree.
 - Title similarity 0.78-0.85: possible match; mark as partial unless corroborated by DOI/PMID.
 - Title similarity < 0.70 for a supplied DOI/PMID: identifier hijacking unless adjacent-entry checks prove shifted identifier.
-- Year difference of 0-1 year can be online-first drift. Larger differences are corruption unless the source explains it.
-- First-author disagreement is a warning; combine it with title/year/journal evidence before deciding severity.
+- A one-year difference may be online-first drift, but remains a field difference unless source dates establish equivalence. Missing year/author evidence cannot satisfy full verification.
+- Author disagreement prevents automatic approval. Compare available authors and report differences. A differing journal is a conflict unless an explicit provider abbreviation matches.
 
 ## Short-circuit rules
 
@@ -43,7 +44,7 @@
 - If a DOI/PMID resolves but title is unreliable, mark `verified_identifier_only`; do not mark `identifier_hijacking`.
 - If a row has no reliable title and no resolvable DOI/PMID, mark `parser_error` and stop.
 - Use DOI verification first: `GET https://api.crossref.org/works/{doi}`. This is the primary source of DOI/title/author/journal/year truth.
-- Start enabled evidence lines together. Fast stops after primary evidence, Balanced allows a 2.5-second auxiliary grace period, and Strict waits for every enabled line to complete or explicitly fail. Network timeout, rate limiting, not-found, parsing failure, mode skip, and expired budget must remain distinguishable.
+- Start enabled evidence lines together. Fast stops after primary evidence, Balanced allows a 2.5-second auxiliary grace period after primary DOI lookup and enabled supplied-PMID lookup, and Strict waits for every enabled line to complete or explicitly fail. Network timeout, rate limiting, not-found, parsing failure, mode skip, and expired budget must remain distinguishable.
 - If PubMed and OpenAlex are disabled with `--pubmed-mode off --openalex-mode off`, do not apply the grace timer to Crossref; Crossref DOI verification must complete because it is the primary authority.
 - OpenAlex checks use `GET https://api.openalex.org/works/doi:{doi}` or external IDs such as `pmid:{pmid}` for PMID, and `GET https://api.openalex.org/works?search={title}&per_page=3` for DOI-missing title recovery.
 - If an entry has no DOI, use title recovery in this order: Crossref title query first, OpenAlex title query only if the Crossref match is weak, PubMed title query only if biomedical corroboration is still needed. Record recovered DOI values in the report and ask before adding them to formatted citations.
@@ -92,9 +93,9 @@ Auto-fix only when canonical evidence is strong:
 - include PMID only as secondary metadata when DOI-backed evidence exists
 - standardize journal title or abbreviation
 - normalize author initials and year formatting
-- move a shifted DOI/PMID only when nearby title similarity is strong
+- report shifted DOI/PMID as a candidate relationship; retain the original until the proposed move is reviewed
 
-Do not auto-delete or silently replace severe items. For `identifier_hijacking`, `total_fabrication`, and low-confidence `partial_attribute_corruption`, report and ask the user.
+Do not auto-delete or silently replace severe items. For identifier-only, shifted, hijacked, fabricated, unresolved, and any partial/conflicting records, retain the original and report. Only verified/minor results may be automatically reformatted. Keep per-field before/after evidence.
 
 Do not create hidden persistent caches. Reuse prior results only from an explicitly supplied structured verifier artifact, and re-query new, changed, or incomplete records.
 
@@ -107,7 +108,24 @@ Do not create hidden persistent caches. Reuse prior results only from an explici
 
 ## Body-vs-bibliography audit
 
+Only execute this section when the user explicitly requests manuscript-body checking or cleanup. Bibliography verification alone does not authorize changing body claims.
+
 - Scan body text for narrative citations like `Author et al. (2023)` and parenthetical citations like `(Author, 2023)`.
 - Compare author/year/title semantics, not just numbered reference markers.
 - After deleting or flagging a fabricated reference, remove or flag body claims that depend on it.
 - Report uncertain claims separately instead of silently preserving them.
+
+## Eligibility, reuse and cleanup
+
+- The user requires a positive-use gate: references that cannot be verified are not usable. Identifier existence alone is insufficient. Formatting-only results are not authenticity passes. Preserve detailed reasons alongside this gate.
+- Results record verification coverage, eligibility, repair state and field differences independently. HTML groups are navigation aids, not replacements for these fields.
+- Reuse only complete compatible evidence checked within 30 days under the current policy, with all source fields unchanged. Stronger modes and additional channels require fresh checks. Regenerate formatted output under the current options.
+- Clean current-run redundant parser views/extracted copies by default; retain normalized source records and requested evidence artifacts. Honor `--cleanup-process-files none`. Ask after each round about retaining the remaining process files; no answer means keep. Never erase prior evidence just because an output option was omitted.
+
+## Real-reference matching details
+
+Trailing `et al.` denotes author truncation, not a named author. Compare the named prefix after conservative typographic normalization. Do not approve a different second or third author. Parse PubMed collective authors. A title containing commas is valid unless the comma-separated pieces actually have author-name syntax.
+
+Recognized publisher placeholder titles are inadequate metadata. A matching record from an enabled channel for the same DOI may supply the bibliographic title, with the fallback recorded. Without such evidence, retain an unresolved result; do not declare hijacking from the placeholder.
+
+Page forms such as `E5503-12` and `E5503-E5512`, or `e136-e136` and `e136`, are equivalent. Distinct electronic article numbers are not normalized into one another. Same-DOI journal aliases and explicit provider publication-year values are evidence of legitimate variants. Retain provider-specific records in the audit JSON.

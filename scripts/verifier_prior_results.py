@@ -6,6 +6,7 @@ import json
 import os
 import re
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -28,7 +29,7 @@ def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
 
 
 def _norm(value: Any) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    return re.sub(r"[\W_]+", " ", str(value or "").casefold()).strip()
 
 
 def _result_keys(row: dict[str, Any]) -> list[str]:
@@ -58,7 +59,13 @@ def prior_result_for_entry(rows: dict[str, dict[str, Any]], entry: Any) -> dict[
     }
     for key in _result_keys(probe):
         if key in rows:
-            return rows[key]
+            row = rows[key]
+            saved = row.get("source_fields")
+            if not isinstance(saved, dict):
+                continue
+            fields = ("title", "authors", "year", "journal", "doi", "pmid", "volume", "issue", "pages", "article_number", "urls")
+            if all(_norm(saved.get(field)) == _norm(getattr(entry, field)) for field in fields):
+                return row
     return None
 
 
@@ -103,7 +110,7 @@ def normalize_artifact(payload: dict[str, Any]) -> dict[str, Any]:
     return index_to_audit(payload) if payload.get("schema") == INDEX_SCHEMA else payload
 
 
-def load_prior_results(path: str, warnings: list[str] | None = None) -> dict[str, dict[str, Any]]:
+def load_prior_results(path: str, warnings: list[str] | None = None, *, pipeline: str | None = None, mode: str = "balanced", channels: list[str] | None = None, policy_version: str | None = None) -> dict[str, dict[str, Any]]:
     try:
         payload = json.loads(Path(path).read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
@@ -112,6 +119,8 @@ def load_prior_results(path: str, warnings: list[str] | None = None) -> dict[str
         raise ValueError("Prior artifact must be a JSON object")
     payload = index_to_audit(payload, warnings) if payload.get("schema") == INDEX_SCHEMA else payload
     rows = payload.get("results", [])
+    if not isinstance(rows, list):
+        raise ValueError("Prior artifact results must be a list")
     reusable = {}
     skipped = 0
     for row in rows:
@@ -120,6 +129,27 @@ def load_prior_results(path: str, warnings: list[str] | None = None) -> dict[str
             continue
         original = str(row.get("original") or "").strip()
         status = str(row.get("status") or "")
+        valid = isinstance(row.get("canonical"), dict) and isinstance(row.get("source_fields"), dict)
+        if valid:
+            canonical = row["canonical"]
+            valid = isinstance(canonical.get("source"), str) and isinstance(canonical.get("title"), str) and bool(canonical.get("title"))
+            valid = valid and isinstance(canonical.get("authors"), list) and all(isinstance(a, str) for a in canonical.get("authors", []))
+            valid = valid and all(isinstance(canonical.get(f, ""), str) for f in ("year", "doi", "pmid", "journal", "volume", "issue", "pages"))
+        valid = valid and status in {"verified", "minor_fix", "formatted_only"}
+        valid = valid and (pipeline is None or row.get("pipeline") == pipeline)
+        valid = valid and (policy_version is None or row.get("policy_version") == policy_version)
+        if pipeline == "verify":
+            ranks = {"fast": 0, "balanced": 1, "strict": 2}
+            valid = valid and ranks.get(row.get("check_mode"), -1) >= ranks[mode]
+            valid = valid and set(channels or []).issubset(row.get("check_channels") or [])
+        try:
+            age = (datetime.now(timezone.utc) - datetime.fromisoformat(row.get("checked_at", ""))).total_seconds()
+            valid = valid and 0 <= age <= 30 * 86400
+        except (ValueError, TypeError):
+            valid = False
+        if not valid:
+            skipped += 1
+            continue
         if original and status:
             for key in _result_keys(row):
                 reusable[key] = row
