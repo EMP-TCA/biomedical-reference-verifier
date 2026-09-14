@@ -62,7 +62,7 @@ YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 REF_HEADING_RE = re.compile(r"^\s{0,3}#{0,6}\s*(references|bibliography|参考文献)\s*$", re.I)
 WORKSHEET_REQUIRED_FIELDS = {"title", "doi"}
 MACHINE_RECORD_SCHEMA = "biomedical-reference-verifier.records.v1"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 POLICY_VERSION = "2026-09-14.1"
 WORKSHEET_HEADER_ALIASES = {
     "#": "index",
@@ -697,7 +697,7 @@ def dedupe_doi_entries(entries: list[ReferenceEntry]) -> list[ReferenceEntry]:
 class ApiClient:
     def __init__(
         self,
-        email: str,
+        email: str = "",
         timeout: int = 8,
         crossref_workers: int = CROSSREF_POLITE_CONCURRENCY,
         pubmed_workers: int = 0,
@@ -735,7 +735,7 @@ class ApiClient:
 
     def get_bytes(self, url: str) -> bytes:
         headers = {
-            "User-Agent": f"biomedical-reference-verifier/{VERSION} (mailto:{self.email})",
+            "User-Agent": f"biomedical-reference-verifier/{VERSION}" + (f" (mailto:{self.email})" if self.email else ""),
             "Accept": "application/json, text/xml;q=0.9, */*;q=0.8",
         }
         req = urllib.request.Request(url, headers=headers)
@@ -788,7 +788,7 @@ class ApiClient:
         if doi in self.crossref_doi_cache:
             return self.crossref_doi_cache[doi]
         try:
-            params = urllib.parse.urlencode({"mailto": self.email})
+            params = urllib.parse.urlencode({"mailto": self.email} if self.email else {})
             url = "https://api.crossref.org/works/" + urllib.parse.quote(doi, safe="") + "?" + params
             item = self.get_json(url).get("message", {})
             record = crossref_record(item, score=1.0)
@@ -813,7 +813,7 @@ class ApiClient:
             params = {
                 "query.title": query,
                 "rows": str(limit),
-                "mailto": self.email,
+                **({"mailto": self.email} if self.email else {}),
             }
             url = "https://api.crossref.org/works?" + urllib.parse.urlencode(params)
             items = self.get_json(url)["message"]["items"]
@@ -840,7 +840,7 @@ class ApiClient:
                     "id": ",".join(missing),
                     "retmode": "xml",
                     "tool": "biomedical-reference-verifier",
-                    "email": self.email,
+                    **({"email": self.email} if self.email else {}),
                 }
                 if self.ncbi_api_key:
                     params["api_key"] = self.ncbi_api_key
@@ -870,7 +870,7 @@ class ApiClient:
                 "retmode": "json",
                 "retmax": str(limit),
                 "tool": "biomedical-reference-verifier",
-                "email": self.email,
+                **({"email": self.email} if self.email else {}),
             }
             if self.ncbi_api_key:
                 params["api_key"] = self.ncbi_api_key
@@ -956,7 +956,7 @@ class ApiClient:
             "retmode": "json",
             "retmax": str(max(len(dois) * 3, 20)),
             "tool": "biomedical-reference-verifier",
-            "email": self.email,
+            **({"email": self.email} if self.email else {}),
         }
         if self.ncbi_api_key:
             params["api_key"] = self.ncbi_api_key
@@ -2290,6 +2290,7 @@ def write_outputs(
     cleanup_process_files: str = "",
     metrics: RuntimeMetrics | None = None,
     write_index: bool = False,
+    report_language: str = "zh",
 ) -> dict[str, str]:
     paths = build_output_paths(input_path, output_dir, detail_output)
     validate_output_paths(input_path, paths, output_dir / "reference-index.json" if write_index else None)
@@ -2312,6 +2313,7 @@ def write_outputs(
         results=results,
         format_consistency=fmt,
         runtime=metrics,
+        language=report_language,
     )
     paths.fixed.write_text(fixed, encoding="utf-8")
 
@@ -2681,6 +2683,7 @@ def escape_pipe(value: str) -> str:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Batch-verify or format biomedical references.")
+    parser.add_argument("--report-language", choices=["zh", "en"], default="zh", help="HTML report language (default: zh)")
     parser.add_argument("--version", action="version", version=VERSION)
     parser.add_argument("input", help="Text, Markdown, or manuscript file containing references")
     parser.add_argument("--output-dir", help="Directory for summary/detail/fixed/json outputs. Defaults to a temp directory.")
@@ -2703,7 +2706,7 @@ def main() -> int:
     parser.add_argument("--ncbi-api-key", default=os.environ.get("NCBI_API_KEY") or "", help="Optional NCBI API key; raises PubMed E-utilities rate from 3 to 10 requests/second")
     parser.add_argument("--openalex-api-key", default=os.environ.get("OPENALEX_API_KEY") or "", help="Optional OpenAlex API key")
     parser.add_argument("--max-records", type=int, default=0, help="Limit records for testing")
-    parser.add_argument("--email", default=os.environ.get("USER_EMAIL") or os.environ.get("CLAWDBOT_EMAIL") or "anonymous@example.org")
+    parser.add_argument("--email", default="", help="Optional contact email sent to bibliographic providers only when explicitly supplied")
     parser.add_argument("--json", action="store_true", help="Print JSON instead of the chat summary")
     parser.add_argument("--format", choices=["markdown", "json"], default="markdown", help="Compatibility option for older usage")
     parser.add_argument("--keep-process-json", action="store_true", help="Keep reference-audit.json for debugging or continuation; default cleans/skips this process file")
@@ -2823,6 +2826,7 @@ def main() -> int:
             cleanup_process_files=args.cleanup_process_files,
             metrics=metrics,
             write_index=args.write_index,
+            report_language=args.report_language,
         )
     except ValueError as exc:
         print(str(exc), file=sys.stderr)

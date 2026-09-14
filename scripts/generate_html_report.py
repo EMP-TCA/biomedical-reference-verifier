@@ -88,7 +88,21 @@ def _safe_json_for_script(payload: dict[str, Any]) -> str:
     )
 
 
-def render_html(payload: dict[str, Any], template_path: Path = TEMPLATE_PATH) -> str:
+def render_html(payload: dict[str, Any], template_path: Path | None = None, language: str = "zh") -> str:
+    if language not in {"zh", "en"}:
+        raise ValueError("Report language must be zh or en")
+    if template_path is None:
+        template_path = TEMPLATE_PATH if language == "zh" else TEMPLATE_PATH.with_name("reference-audit-report-template.en.html")
+    if language == "en":
+        payload = json.loads(json.dumps(payload))
+        for row in payload.get("results", []):
+            for field in ("fixed_reference", "suggested_action"):
+                value = row.get(field)
+                if isinstance(value, str):
+                    row[field] = value.replace("不可用：当前证据未通过核查。保留原文供复核，不纳入可用引用。 ", "Not eligible: current evidence does not pass verification. Retain the original for review. ").replace("[不可用：", "[Not eligible: ").replace("，未自动修复]", "; not auto-repaired]")
+            for difference in row.get("field_differences", []):
+                if difference.get("after") == "未取得对应证据":
+                    difference["after"] = "Corresponding evidence unavailable"
     template = template_path.read_text(encoding="utf-8")
     if template.count(TEMPLATE_MARKER) != 1:
         raise ValueError(f"HTML template must contain exactly one {TEMPLATE_MARKER} marker")
@@ -103,7 +117,8 @@ def write_html_report(
     results: Iterable[Any],
     format_consistency: dict[str, Any] | None = None,
     runtime: Any | None = None,
-    template_path: Path = TEMPLATE_PATH,
+    template_path: Path | None = None,
+    language: str = "zh",
 ) -> Path:
     payload = build_report_payload(
         input_path=input_path,
@@ -111,7 +126,7 @@ def write_html_report(
         format_consistency=format_consistency,
         runtime=runtime,
     )
-    output_path.write_text(render_html(payload, template_path), encoding="utf-8")
+    output_path.write_text(render_html(payload, template_path, language), encoding="utf-8")
     return output_path
 
 
@@ -119,7 +134,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Render a verifier audit JSON as an interactive HTML report.")
     parser.add_argument("audit_json", help="reference-audit.json produced with --keep-process-json")
     parser.add_argument("--output", required=True, help="HTML report output path")
-    parser.add_argument("--template", default=str(TEMPLATE_PATH), help="Optional compatible HTML template")
+    parser.add_argument("--language", choices=["zh", "en"], default="zh", help="Report interface language")
+    parser.add_argument("--template", help="Optional compatible HTML template")
     args = parser.parse_args()
 
     payload = json.loads(Path(args.audit_json).read_text(encoding="utf-8"))
@@ -129,7 +145,7 @@ def main() -> int:
         format_consistency=payload.get("format_consistency", {}),
         runtime=payload.get("runtime", {}),
     )
-    Path(args.output).write_text(render_html(report, Path(args.template)), encoding="utf-8")
+    Path(args.output).write_text(render_html(report, Path(args.template) if args.template else None, args.language), encoding="utf-8")
     return 0
 
 

@@ -1,6 +1,6 @@
 ---
 name: biomedical-reference-verifier
-version: 1.2.0
+version: 1.2.1
 description: "Verify or normalize biomedical and life-science reference lists, when the task is about AI-caused reference errors. Checks identifiers and bibliographic fields, preserves source evidence, and produces a searchable offline report. 生物医学/生命科学参考文献真实性验证skill，可以对参考文献列表（引文列表）进行多轮核查和错误修复，附带引文格式整理功能，能统一规范化所有引文为AMA、APA、GB/T 7714等格式。"
 metadata:
   openclaw:
@@ -172,3 +172,28 @@ This skill does not require another design skill to maintain its report template
 - Treat abbreviated page ranges and repeated electronic page endpoints as equivalent; distinct article numbers remain conflicts.
 - If a primary provider returns a recognized placeholder title such as `OUP accepted manuscript`, compare other enabled records for exactly the same DOI. Use a matching title/author/year record and disclose the fallback; do not replace the DOI. A placeholder alone cannot establish hijacking.
 - Retain same-identifier journal aliases and explicit publication years from provider evidence. Preserve a valid source year when it matches a known publication year. Save `provider_records` in structured results for reproducible diagnosis.
+
+## Implementation map and review scope
+
+These files implement the advertised workflow; inspect them together rather than inferring missing functionality from one chunk:
+
+| Capability | Implementation | Offline verification |
+| --- | --- | --- |
+| Input normalization, Crossref/PubMed/OpenAlex lookup and field comparison | `scripts/verify_references.py` | `scripts/test_verification_boundaries.py` |
+| Formatting, output safety and query-failure handling | `scripts/verify_references.py` | `scripts/test_release_boundaries.py` |
+| HTML payload escaping and report generation | `scripts/generate_html_report.py` | `scripts/self_test_verify_references.py`, `scripts/test_privacy_language.py` |
+| Chinese and English report layout and filtering | `assets/reference-audit-report-template.html`, `assets/reference-audit-report-template.en.html` | `scripts/test_privacy_language.py` |
+| Evidence reuse and artifact conversion | `scripts/verifier_prior_results.py`, `scripts/convert_reference_artifact.py` | `scripts/self_test_verify_references.py` |
+
+The skill executes local Python, reads the selected reference input, writes reports, and queries the documented bibliographic services. Formatting-only is offline. Verification sends DOI/PMID and, for title recovery, reference titles; it does not need manuscript paragraphs. Tests use subprocess argument lists to exercise local scripts. HTML templates are bundled and have no external script/font dependencies. This implementation map aids inspection; it is not a security certification.
+
+## Contact email and report language
+
+Do not read `USER_EMAIL` or `CLAWDBOT_EMAIL`. No contact email is included by default. Only pass `--email` when the user explicitly wants a contact email sent to the enabled bibliographic providers. The two optional provider API keys retain their existing purpose.
+
+Choose the HTML language from the user's request or conversation language: `--report-language en` for English and `--report-language zh` for Chinese. The CLI default remains Chinese for compatibility. Both templates show the complete report with the same filters, eligibility rules, copy and print functions. Preserve source citations and provider evidence in their original language; selecting English translates the interface and generated eligibility messages, not the cited research.
+
+```bash
+python3 scripts/verify_references.py records.json --input-mode records --report-language en
+python3 scripts/generate_html_report.py reference-audit.json --output report.en.html --language en
+```

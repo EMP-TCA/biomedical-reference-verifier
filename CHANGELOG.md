@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.2.1 — 2026-09-14
+
+- Remove ambient email reads and omit contact email from requests unless explicitly supplied.
+- Add selectable English HTML report template and localized generated eligibility messages.
+- Document implementation locations for capability review; add privacy and language regression tests.
+
 ## 1.2.0 — 2026-09-14
 
 Minor release following public version 1.1.3. SKILL.md and the CLI both identify this release as 1.2.0.
