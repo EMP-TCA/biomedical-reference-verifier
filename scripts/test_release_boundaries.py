@@ -1,4 +1,4 @@
-"""Offline regressions for release 2.1.0 data-integrity boundaries."""
+"""Offline regressions for release 1.2.0 data-integrity boundaries."""
 import json
 import os
 from pathlib import Path

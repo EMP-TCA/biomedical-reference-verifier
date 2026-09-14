@@ -1,8 +1,8 @@
 # Changelog
 
-## 2.1.0 — 2026-09-14
+## 1.2.0 — 2026-09-14
 
-The previous implementation identified itself as 2.0 in HTTP requests; it had no formal release-version field. This release establishes 2.1.0 in SKILL.md and the CLI.
+Minor release following public version 1.1.3. SKILL.md and the CLI both identify this release as 1.2.0.
 
 - Reject duplicate reference indices before verification or writing outputs, preventing silent loss or duplication of results.
 - Reject output paths that alias the source, an explicitly reused artifact, or another output, including symlinks and hardlinks.

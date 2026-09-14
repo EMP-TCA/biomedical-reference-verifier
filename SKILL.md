@@ -1,6 +1,6 @@
 ---
 name: biomedical-reference-verifier
-version: 2.1.0
+version: 1.2.0
 description: "Verify or normalize biomedical and life-science reference lists, when the task is about AI-caused reference errors. Checks identifiers and bibliographic fields, preserves source evidence, and produces a searchable offline report. 生物医学/生命科学参考文献真实性验证skill，可以对参考文献列表（引文列表）进行多轮核查和错误修复，附带引文格式整理功能，能统一规范化所有引文为AMA、APA、GB/T 7714等格式。"
 metadata:
   openclaw:

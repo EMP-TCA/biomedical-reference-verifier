@@ -62,7 +62,7 @@ YEAR_RE = re.compile(r"\b(19|20)\d{2}\b")
 REF_HEADING_RE = re.compile(r"^\s{0,3}#{0,6}\s*(references|bibliography|参考文献)\s*$", re.I)
 WORKSHEET_REQUIRED_FIELDS = {"title", "doi"}
 MACHINE_RECORD_SCHEMA = "biomedical-reference-verifier.records.v1"
-VERSION = "2.1.0"
+VERSION = "1.2.0"
 POLICY_VERSION = "2026-09-14.1"
 WORKSHEET_HEADER_ALIASES = {
     "#": "index",
